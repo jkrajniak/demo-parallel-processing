@@ -1,0 +1,211 @@
+service: compute
+frameworkVersion: '>=1.28.0 <2.0.0'
+
+provider:
+  name: aws
+  runtime: go1.x
+  stage: ${opt:stage}
+  region: ${opt:region}
+  logRetentionInDays: 14
+  memorySize: 128
+  tags: &tags
+    Environment: ${opt:stage}
+    Service: demo
+    Microservice: compute
+  stackTags: *tags
+  timeout: 60
+  iamRoleStatements:
+    - Effect: "Allow"
+      Action:
+        - "s3:ListBucket"
+        - "s3:GetObject"
+      Resource: "*"
+
+  environment:
+    LOG_LEVEL: DEBUG
+    REGION: ${opt:region}
+    STAGE: ${opt:stage}
+    PROCESS_STATE_TABLE_NAME: !Ref ProcessStateTable
+  role: lambdasDefaultRole
+
+package:
+  individually: true
+  exclude:
+    - ./**
+
+functions:
+  splitter:
+    handler: ./build/splitter
+    package:
+      include:
+        - ./build/splitter
+    environment:
+      DOCUMENT_PROCESSOR_INPUT_SQS_URL: !Ref DocumentProcessorInputQueue
+      INTERNAL_INPUT_SQS_URL: !Ref SplitterInputQueue
+      OBSERVER_INPUT_SQS_URL: !Ref ObserverInputQueue
+    events:
+      - sqs:
+          arn:
+            Fn::GetAtt:
+              - SplitterInputQueue
+              - Arn
+          batchSize: 1
+
+  documentProcessor:
+    handler: ./build/document-processor
+    package:
+      include:
+        - ./build/document-processor
+    environment:
+      INTERNAL_INPUT_SQS_URL: !Ref DocumentProcessorInputQueue
+    events:
+      - sqs:
+          arn:
+            Fn::GetAtt:
+              - DocumentProcessorInputQueue
+              - Arn
+          batchSize: 1
+
+  observer:
+    handler: ./build/observer
+    package:
+      include:
+        - ./build/observer
+    environment:
+      JOB_STATE_NOTIFY_SNS_TOPIC_ARN: !Ref JobStateNotifySNSTopic
+      INTERNAL_INPUT_SQS_URL: !Ref ObserverInputQueue
+    events:
+      - sqs:
+          arn:
+            Fn::GetAtt:
+              - ObserverInputQueue
+              - Arn
+          batchSize: 1
+
+resources:
+  Resources:
+    SplitterInputQueue:
+      Type: AWS::SQS::Queue
+      Properties:
+        VisibilityTimeout: 300
+        RedrivePolicy:
+          deadLetterTargetArn: !GetAtt  SplitterInputQueueDlq.Arn
+          maxReceiveCount: 5
+
+    SplitterInputQueueDlq:
+      Type: AWS::SQS::Queue
+
+    DocumentProcessorInputQueue:
+      Type: AWS::SQS::Queue
+      Properties:
+        VisibilityTimeout: 300
+        RedrivePolicy:
+          deadLetterTargetArn: !GetAtt  DocumentProcessorInputQueueDlq.Arn
+          maxReceiveCount: 5
+
+    DocumentProcessorInputQueueDlq:
+      Type: AWS::SQS::Queue
+
+    ObserverInputQueue:
+      Type: AWS::SQS::Queue
+      Properties:
+        VisibilityTimeout: 300
+        DelaySeconds: 30
+        RedrivePolicy:
+          deadLetterTargetArn: !GetAtt  ObserverInputQueueDlq.Arn
+          maxReceiveCount: 5
+
+    ObserverInputQueueDlq:
+      Type: AWS::SQS::Queue
+
+    JobStateNotifySNSTopic:
+      Type: AWS::SNS::Topic
+
+    ProcessStateTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        AttributeDefinitions:
+          - AttributeName: job_id
+            AttributeType: S
+          - AttributeName: process_id
+            AttributeType: S
+          - AttributeName: state__process_id
+            AttributeType: S
+        KeySchema:
+          - AttributeName: job_id
+            KeyType: HASH
+          - AttributeName: process_id
+            KeyType: RANGE
+        BillingMode: PAY_PER_REQUEST
+        GlobalSecondaryIndexes:
+          - IndexName: stateProcessID
+            KeySchema:
+              - AttributeName: job_id
+                KeyType: HASH
+              - AttributeName: state__process_id
+                KeyType: RANGE
+            Projection:
+              ProjectionType: KEYS_ONLY
+
+    lambdasDefaultRole:
+      Type: AWS::IAM::Role
+      Properties:
+        AssumeRolePolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Principal:
+                Service:
+                  - lambda.amazonaws.com
+              Action: sts:AssumeRole
+        ManagedPolicyArns:
+          - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        Policies:
+          - PolicyName: 'defaultLambdaPolicy'
+            PolicyDocument:
+              Version: '2012-10-17'
+              Statement:
+                - Effect: Allow
+                  Action:
+                    - logs:CreateLogGroup
+                    - logs:CreateLogStream
+                    - logs:PutLogEvents
+                  Resource:
+                    - 'Fn::Join':
+                        - ':'
+                        - - 'arn:aws:logs'
+                          - Ref: 'AWS::Region'
+                          - Ref: 'AWS::AccountId'
+                          - 'log-group:/aws/lambda/*:*:*'
+                - Effect: Allow
+                  Action:
+                    - sns:Publish
+                  Resource: '*'
+                - Effect: Allow
+                  Action:
+                    - s3:GetObject
+                    - s3:PutObject
+                    - s3:ListBucket
+                  Resource: '*'
+                - Effect: Allow
+                  Action:
+                    - ssm:GetParameter
+                    - ssm:GetParameters
+                    - ssm:GetParametersByPath
+                  Resource: '*'
+                - Effect: Allow
+                  Action:
+                    - sqs:SendMessage
+                    - sqs:DeleteMessage
+                    - sqs:ReceiveMessage
+                    - sqs:ChangeMessageVisibility
+                    - sqs:GetQueueAttributes
+                  Resource: '*'
+                - Effect: Allow
+                  Action:
+                    - dynamodb:PutItem
+                    - dynamodb:GetItem
+                    - dynamodb:Query
+                    - dynamodb:Scan
+                    - dynamodb:UpdateItem
+                  Resource: '*'
